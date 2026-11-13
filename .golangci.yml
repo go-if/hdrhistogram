@@ -1,0 +1,70 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+  modules-download-mode: readonly
+
+linters:
+  default: none
+  enable:
+    - asasalint
+    - bidichk
+    - bodyclose
+    - canonicalheader
+    - clickhouselint
+    - copyloopvar
+    - durationcheck
+    - embeddedstructfieldcheck
+    - errcheck
+    - errorlint
+    - exhaustruct_v5
+    - exptostd
+    - fatcontext
+    - goconst
+    - gocritic
+    - gosec
+    - govet
+    - ineffassign
+    - intrange
+    - iotamixing
+    - makezero
+    - mirror
+    - misspell
+    - modernize
+    - musttag
+    - nakedret
+    - nilerr
+    - nilnesserr
+    - nolintlint
+    - nosprintfhostport
+    - paralleltest
+    - perfsprint
+    - predeclared
+    - protogetter
+    - reassign
+    - revive
+    - sloglint
+    - spancheck
+    - staticcheck
+    - testifylint
+    - unconvert
+    - unused
+    - usestdlibvars
+    - wastedassign
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
