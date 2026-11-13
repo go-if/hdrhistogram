@@ -4,7 +4,8 @@
 
 This repository contains the `github.com/go-if/hdrhistogram` Go library. Production
 code lives at the root: `geometry.go` implements bucket indexing, `histogram.go`
-manages mutable state, and `snapshot.go` provides immutable views. Package
+manages synchronized mutations, `data.go` implements private histogram arithmetic,
+and `snapshot.go` provides immutable analysis. Package
 documentation is in `doc.go`; usage examples are in `README.md` and
 `example_test.go`. Unit, concurrency, fuzz, and benchmark tests use `*_test.go`.
 Lint configuration lives in `.golangci.yml`, with CI in `.github/workflows/lint.yml`.

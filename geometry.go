@@ -31,8 +31,8 @@ func newGeometry(lowest, highest int64, figures int) (geometry, error) {
 	}
 	unitMagnitude := uint(bits.Len64(uint64(lowest)) - 1)
 	subMagnitude := uint(bits.Len64(resolution - 1))
-	// Keep the initial sub-bucket geometry representable in a positive int64,
-	// as in the reference HDR implementation. Later buckets can cover MaxInt64.
+	// Keep the initial sub-bucket geometry representable in a positive int64.
+	// Later buckets can cover MaxInt64.
 	if unitMagnitude+subMagnitude > 62 {
 		return geometry{}, fmt.Errorf("%w: resolution and lowestDiscernible exceed representable geometry", ErrInvalidArgument)
 	}

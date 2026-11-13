@@ -20,7 +20,7 @@ func newTestHistogram(t testing.TB, lowest, highest int64, figures int) *Histogr
 
 func record(t testing.TB, h *Histogram, value, count int64) {
 	t.Helper()
-	require.NoError(t, h.RecordValues(value, count))
+	require.NoError(t, h.RecordN(value, count))
 }
 
 func unchanged(t *testing.T, h *Histogram, before *Snapshot) {
@@ -71,6 +71,7 @@ func TestNew(t *testing.T) {
 		{"negative highest", 1, -1, 3, ErrInvalidArgument},
 		{"negative precision", 1, 100, -1, ErrInvalidArgument},
 		{"excess precision", 1, 100, 6, ErrInvalidArgument},
+		{"maximum precision integer", 1, 100, math.MaxInt, ErrInvalidArgument},
 		{"maximum lowest", math.MaxInt64, math.MaxInt64, 0, ErrInvalidArgument},
 		{"lowest multiplication overflow", math.MaxInt64/2 + 1, math.MaxInt64, 0, ErrInvalidArgument},
 		{"unrepresentable geometry", 1 << 61, 1 << 62, 1, ErrInvalidArgument},
@@ -97,9 +98,9 @@ func TestNew(t *testing.T) {
 			require.NotNil(t, h)
 			record(t, h, 0, 1)
 			record(t, h, tc.highest, 1)
-			assert.Equal(t, int64(2), h.TotalCount())
+			assert.Equal(t, int64(2), h.Snapshot().TotalCount())
 			_, upper := oracleBounds(tc.highest, tc.lowest, tc.figures)
-			assert.Equal(t, upper, h.Max())
+			assert.Equal(t, upper, h.Snapshot().Max())
 		})
 	}
 }
@@ -139,46 +140,32 @@ func TestGeometry(t *testing.T) {
 	}
 }
 
-type queryView interface {
-	TotalCount() int64
-	Min() int64
-	Max() int64
-	Mean() float64
-	StdDev() float64
-	ValueAtPercentile(float64) (int64, error)
-}
-
-type namedQueryView struct {
-	name string
-	view queryView
-}
-
-func queryViews(h *Histogram) []namedQueryView {
-	return []namedQueryView{
-		{name: "histogram", view: h},
-		{name: "snapshot", view: h.Snapshot()},
-	}
-}
-
 type percentileCase struct {
 	percentile float64
 	want       int64
 }
 
-func assertPercentiles(t *testing.T, view queryView, tests []percentileCase) {
+func assertPercentiles(t *testing.T, view *Snapshot, tests []percentileCase) {
 	t.Helper()
+	ps, want := make([]float64, len(tests)), make([]int64, len(tests))
+	for i, tc := range tests {
+		ps[i], want[i] = tc.percentile, tc.want
+	}
+	got, err := view.Percentiles(ps)
+	require.NoError(t, err)
+	assert.Equal(t, want, got)
 	for _, tc := range tests {
 		t.Run(fmt.Sprintf("p%g", tc.percentile), func(t *testing.T) {
 			t.Parallel()
 
-			got, err := view.ValueAtPercentile(tc.percentile)
+			got, err := view.Percentile(tc.percentile)
 			require.NoError(t, err)
 			assert.Equal(t, tc.want, got)
 		})
 	}
 }
 
-func assertSampleStatistics(t *testing.T, view queryView, midpointSamples []int64) {
+func assertSampleStatistics(t *testing.T, view *Snapshot, midpointSamples []int64) {
 	t.Helper()
 	var sum float64
 	for _, v := range midpointSamples {
@@ -231,10 +218,8 @@ func TestStatisticsAndPercentiles(t *testing.T) {
 			percentiles: []percentileCase{{0, 0}, {50, 0}, {75, 10}, {100, 100}},
 		},
 		{
-			// Fixtures for the three-digit bucket overlap diagram by Gil Tene:
-			// https://github.com/HdrHistogram/HdrHistogram/blob/master/src/main/java/org/HdrHistogram/AbstractHistogram.java
 			// Bounds and midpoints are independent of the production indexing helpers.
-			name:      "reference bucket boundaries",
+			name:      "bucket boundaries",
 			samples:   []sample{{0, 1}, {2047, 1}, {2048, 1}, {2049, 1}, {4095, 1}, {4096, 1}, {4099, 1}},
 			midpoints: []int64{0, 2047, 2049, 2049, 4095, 4098, 4098}, min: 0, max: 4099,
 			percentiles: []percentileCase{{0, 0}, {25, 2047}, {50, 2049}, {75, 4099}, {100, 4099}},
@@ -247,21 +232,16 @@ func TestStatisticsAndPercentiles(t *testing.T) {
 			for _, s := range tc.samples {
 				record(t, h, s.value, s.count)
 			}
-			for _, view := range queryViews(h) {
-				t.Run(view.name, func(t *testing.T) {
-					t.Parallel()
-
-					assertSampleStatistics(t, view.view, tc.midpoints)
-					assert.Equal(t, tc.min, view.view.Min())
-					assert.Equal(t, tc.max, view.view.Max())
-					assertPercentiles(t, view.view, tc.percentiles)
-				})
-			}
+			view := h.Snapshot()
+			assertSampleStatistics(t, view, tc.midpoints)
+			assert.Equal(t, tc.min, view.Min())
+			assert.Equal(t, tc.max, view.Max())
+			assertPercentiles(t, view, tc.percentiles)
 		})
 	}
 }
 
-func TestReferenceBuckets(t *testing.T) {
+func TestBuckets(t *testing.T) {
 	t.Parallel()
 
 	h := newTestHistogram(t, 1, 10_000, 3)
@@ -269,14 +249,20 @@ func TestReferenceBuckets(t *testing.T) {
 		record(t, h, value, 1)
 	}
 	want := []Bucket{{0, 0, 1}, {2047, 2047, 1}, {2048, 2049, 2}, {4094, 4095, 1}, {4096, 4099, 2}}
-	require.Equal(t, want, slices.Collect(h.RecordedValues()))
+	require.Equal(t, want, slices.Collect(h.Snapshot().Buckets()))
 }
 
 func TestEmptyQueries(t *testing.T) {
 	t.Parallel()
 
 	h := newTestHistogram(t, 1, 100, 3)
-	views := append(queryViews(h), namedQueryView{name: "zero snapshot", view: new(Snapshot)})
+	views := []struct {
+		name string
+		view *Snapshot
+	}{
+		{"configured snapshot", h.Snapshot()},
+		{"zero snapshot", new(Snapshot)},
+	}
 	for _, tc := range views {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -303,24 +289,21 @@ func TestInvalidPercentiles(t *testing.T) {
 
 			h := newTestHistogram(t, 1, 100, 3)
 			record(t, h, 10, state.count)
-			for _, view := range queryViews(h) {
-				t.Run(view.name, func(t *testing.T) {
+			view := h.Snapshot()
+			for _, tc := range []struct {
+				name       string
+				percentile float64
+			}{
+				{"negative", -1}, {"above maximum", 101}, {"NaN", math.NaN()},
+				{"positive infinity", math.Inf(1)}, {"negative infinity", math.Inf(-1)},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
 					t.Parallel()
-
-					for _, tc := range []struct {
-						name       string
-						percentile float64
-					}{
-						{"negative", -1}, {"above maximum", 101}, {"NaN", math.NaN()},
-						{"positive infinity", math.Inf(1)}, {"negative infinity", math.Inf(-1)},
-					} {
-						t.Run(tc.name, func(t *testing.T) {
-							t.Parallel()
-
-							_, err := view.view.ValueAtPercentile(tc.percentile)
-							require.ErrorIs(t, err, ErrInvalidArgument)
-						})
-					}
+					_, err := view.Percentile(tc.percentile)
+					require.ErrorIs(t, err, ErrInvalidArgument)
+					values, err := view.Percentiles([]float64{50, tc.percentile, 100})
+					require.ErrorIs(t, err, ErrInvalidArgument)
+					require.Nil(t, values)
 				})
 			}
 		})
@@ -347,18 +330,18 @@ func TestQuantizationAndStrictMaximum(t *testing.T) {
 			for _, value := range tc.values {
 				record(t, h, value, 1)
 			}
-			assert.Equal(t, tc.min, h.Min())
-			assert.Equal(t, tc.max, h.Max())
-			assert.InDelta(t, tc.mean, h.Mean(), 1e-12)
-			assert.Zero(t, h.StdDev())
+			assert.Equal(t, tc.min, h.Snapshot().Min())
+			assert.Equal(t, tc.max, h.Snapshot().Max())
+			assert.InDelta(t, tc.mean, h.Snapshot().Mean(), 1e-12)
+			assert.Zero(t, h.Snapshot().StdDev())
 			before := h.Snapshot()
-			require.ErrorIs(t, h.RecordValue(tc.highest+1), ErrOutOfRange)
+			require.ErrorIs(t, h.Record(tc.highest+1), ErrOutOfRange)
 			unchanged(t, h, before)
 		})
 	}
 }
 
-func TestRecordValues(t *testing.T) {
+func TestRecordN(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
@@ -385,13 +368,13 @@ func TestRecordValues(t *testing.T) {
 			h := newTestHistogram(t, 1, 100, 3)
 			record(t, h, 5, tc.initial)
 			before := h.Snapshot()
-			err := h.RecordValues(tc.value, tc.count)
+			err := h.RecordN(tc.value, tc.count)
 			if tc.wantErr != nil {
 				require.ErrorIs(t, err, tc.wantErr)
 			} else {
 				require.NoError(t, err)
 			}
-			assert.Equal(t, tc.wantTotal, h.TotalCount())
+			assert.Equal(t, tc.wantTotal, h.Snapshot().TotalCount())
 			if tc.wantErr != nil || tc.count == 0 {
 				unchanged(t, h, before)
 			}
@@ -405,7 +388,7 @@ func TestPercentilesLargeCount(t *testing.T) {
 	h := newTestHistogram(t, 1, 100, 3)
 	record(t, h, 10, math.MaxInt64-1)
 	record(t, h, 100, 1)
-	assertPercentiles(t, h, []percentileCase{
+	assertPercentiles(t, h.Snapshot(), []percentileCase{
 		{0, 10}, {math.SmallestNonzeroFloat64, 10}, {50, 10},
 		{math.Nextafter(100, 0), 10}, {100, 100},
 	})
@@ -437,7 +420,7 @@ func TestCorrectedRecording(t *testing.T) {
 						want := newTestHistogram(t, lowest, 10_000, figures)
 						record(t, h, 7, 2)
 						record(t, want, 7, 2)
-						require.NoError(t, h.RecordCorrectedValue(tc.value, tc.interval))
+						require.NoError(t, h.RecordCorrected(tc.value, tc.interval))
 						record(t, want, tc.value, 1)
 						if tc.interval > 0 {
 							for value := tc.value - tc.interval; value >= tc.interval; value -= tc.interval {
@@ -457,15 +440,15 @@ func TestCorrectedRecordingHugeRatio(t *testing.T) {
 
 	// This represents over nine quintillion samples using only 63 occupied bins.
 	h := newTestHistogram(t, 1, math.MaxInt64, 0)
-	require.NoError(t, h.RecordCorrectedValue(math.MaxInt64, 1))
-	assert.Equal(t, int64(math.MaxInt64), h.TotalCount())
-	assert.Equal(t, int64(1), h.Min())
-	assert.Equal(t, int64(math.MaxInt64), h.Max())
-	for bucket := range h.RecordedValues() {
+	require.NoError(t, h.RecordCorrected(math.MaxInt64, 1))
+	assert.Equal(t, int64(math.MaxInt64), h.Snapshot().TotalCount())
+	assert.Equal(t, int64(1), h.Snapshot().Min())
+	assert.Equal(t, int64(math.MaxInt64), h.Snapshot().Max())
+	for bucket := range h.Snapshot().Buckets() {
 		require.Equal(t, bucket.To-bucket.From+1, bucket.Count, "one sample per integer: %v", bucket)
 	}
 	before := h.Snapshot()
-	require.ErrorIs(t, h.RecordCorrectedValue(100, 10), ErrCountOverflow)
+	require.ErrorIs(t, h.RecordCorrected(100, 10), ErrCountOverflow)
 	unchanged(t, h, before)
 }
 
@@ -488,7 +471,7 @@ func TestCorrectedRecordingErrors(t *testing.T) {
 			h := newTestHistogram(t, 1, 100, 3)
 			record(t, h, 0, math.MaxInt64-5)
 			before := h.Snapshot()
-			require.ErrorIs(t, h.RecordCorrectedValue(tc.value, tc.interval), tc.wantErr)
+			require.ErrorIs(t, h.RecordCorrected(tc.value, tc.interval), tc.wantErr)
 			unchanged(t, h, before)
 		})
 	}
@@ -501,20 +484,20 @@ func TestSnapshotsIterationAndReset(t *testing.T) {
 	record(t, h, 100, 2)
 	record(t, h, 4096, 3)
 	snapshot := h.Snapshot()
-	iterator := h.RecordedValues()
+	iterator := h.Snapshot().Buckets()
 	want := []Bucket{{100, 100, 2}, {4096, 4099, 3}}
 	storage := &h.data.counts[0]
 	h.Reset()
 	assert.Same(t, storage, &h.data.counts[0], "reset must reuse storage")
-	assert.Zero(t, h.TotalCount())
-	assert.Empty(t, slices.Collect(h.RecordedValues()))
+	assert.Zero(t, h.Snapshot().TotalCount())
+	assert.Empty(t, slices.Collect(h.Snapshot().Buckets()))
 	record(t, h, 5, 1)
-	assert.Equal(t, int64(5), h.Min())
-	assert.Equal(t, int64(5), h.Max())
+	assert.Equal(t, int64(5), h.Snapshot().Min())
+	assert.Equal(t, int64(5), h.Snapshot().Max())
 	for _, tc := range []struct {
 		name   string
 		values iter.Seq[Bucket]
-	}{{"captured histogram iterator", iterator}, {"snapshot iterator", snapshot.RecordedValues()}} {
+	}{{"captured snapshot iterator", iterator}, {"snapshot iterator", snapshot.Buckets()}} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -533,7 +516,7 @@ func TestSnapshotsIterationAndReset(t *testing.T) {
 	}
 	assert.Equal(t, 1, iterations)
 	assert.Equal(t, int64(5), snapshot.TotalCount())
-	assert.Empty(t, slices.Collect(new(Snapshot).RecordedValues()))
+	assert.Empty(t, slices.Collect(new(Snapshot).Buckets()))
 }
 
 func TestMerge(t *testing.T) {
@@ -554,11 +537,11 @@ func TestMerge(t *testing.T) {
 		{name: "empty source", destination: []sample{{10, 2}}, source: nil, self: false, want: []Bucket{{10, 10, 2}}},
 		{name: "empty destination", destination: nil, source: []sample{{5, 3}, {4096, 4}}, self: false, want: []Bucket{{5, 5, 3}, {4096, 4099, 4}}},
 		{
-			name:        "self doubles counts",
+			name:        "captured destination",
 			destination: []sample{{5, 3}, {10, 2}, {4096, 4}}, source: nil, self: true,
 			want: []Bucket{{5, 5, 6}, {10, 10, 4}, {4096, 4099, 8}},
 		},
-		{name: "empty self", destination: nil, source: nil, self: true, want: nil},
+		{name: "empty captured destination", destination: nil, source: nil, self: true, want: nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -575,16 +558,16 @@ func TestMerge(t *testing.T) {
 				source = destination
 			}
 			beforeSource := source.Snapshot()
-			require.NoError(t, destination.Merge(source))
+			require.NoError(t, destination.Merge(beforeSource))
 			if !tc.self {
 				unchanged(t, source, beforeSource)
 			}
-			assert.Equal(t, tc.want, slices.Collect(destination.RecordedValues()))
+			assert.Equal(t, tc.want, slices.Collect(destination.Snapshot().Buckets()))
 			var total int64
 			for _, bucket := range tc.want {
 				total += bucket.Count
 			}
-			assert.Equal(t, total, destination.TotalCount())
+			assert.Equal(t, total, destination.Snapshot().TotalCount())
 			require.NoError(t, snapshotProblem(destination.Snapshot()))
 		})
 	}
@@ -611,7 +594,7 @@ func TestMergeIncompatible(t *testing.T) {
 			record(t, h, 10, 1)
 			before := h.Snapshot()
 			source := newTestHistogram(t, tc.lowest, tc.highest, tc.figures)
-			require.ErrorIs(t, h.Merge(source), ErrIncompatibleConfiguration)
+			require.ErrorIs(t, h.Merge(source.Snapshot()), ErrIncompatibleConfiguration)
 			unchanged(t, h, before)
 		})
 	}
@@ -635,7 +618,7 @@ func TestMergeOverflow(t *testing.T) {
 				source = h
 			}
 			before := h.Snapshot()
-			require.ErrorIs(t, h.Merge(source), ErrCountOverflow)
+			require.ErrorIs(t, h.Merge(source.Snapshot()), ErrCountOverflow)
 			unchanged(t, h, before)
 		})
 	}
@@ -648,11 +631,11 @@ func TestInvalidHistogramArguments(t *testing.T) {
 		name string
 		run  func(uninitialized, valid *Histogram) error
 	}{
-		{"record on zero value", func(h, _ *Histogram) error { return h.RecordValue(0) }},
-		{"correct on zero value", func(h, _ *Histogram) error { return h.RecordCorrectedValue(0, 1) }},
-		{"self merge on zero value", func(h, _ *Histogram) error { return h.Merge(h) }},
-		{"merge into zero value", func(h, valid *Histogram) error { return h.Merge(valid) }},
-		{"merge zero value source", func(h, valid *Histogram) error { return valid.Merge(h) }},
+		{"record on zero value", func(h, _ *Histogram) error { return h.Record(0) }},
+		{"correct on zero value", func(h, _ *Histogram) error { return h.RecordCorrected(0, 1) }},
+		{"self merge on zero value", func(h, _ *Histogram) error { return h.Merge(h.Snapshot()) }},
+		{"merge into zero value", func(h, valid *Histogram) error { return h.Merge(valid.Snapshot()) }},
+		{"merge zero value source", func(h, valid *Histogram) error { return valid.Merge(h.Snapshot()) }},
 		{"merge nil source", func(_, valid *Histogram) error { return valid.Merge(nil) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -675,8 +658,9 @@ func TestRecordingAllocations(t *testing.T) {
 		name string
 		run  func(*Histogram) error
 	}{
-		{"single", func(h *Histogram) error { return h.RecordValue(12345) }},
-		{"weighted", func(h *Histogram) error { return h.RecordValues(12345, 100) }},
+		{"single", func(h *Histogram) error { return h.Record(12345) }},
+		{"weighted", func(h *Histogram) error { return h.RecordN(12345, 100) }},
+		{"corrected", func(h *Histogram) error { return h.RecordCorrected(12345, 10) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newTestHistogram(t, 1, 1_000_000, 3)

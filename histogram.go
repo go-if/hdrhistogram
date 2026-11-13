@@ -2,7 +2,6 @@ package hdrhistogram
 
 import (
 	"errors"
-	"iter"
 	"math"
 	"slices"
 	"sync"
@@ -10,7 +9,8 @@ import (
 
 var (
 	// ErrInvalidArgument reports invalid configuration, a negative count or
-	// interval, an invalid percentile, a nil merge source, or an uninitialized histogram.
+	// interval, an invalid percentile, a nil merge source, or an uninitialized
+	// histogram or merge snapshot.
 	ErrInvalidArgument = errors.New("hdrhistogram: invalid argument")
 	// ErrOutOfRange reports a value outside [0, highestTrackable].
 	ErrOutOfRange = errors.New("hdrhistogram: value out of range")
@@ -24,23 +24,37 @@ var (
 // All methods are safe for concurrent use. Construct it with New; the zero value
 // is not ready for recording. A Histogram must not be copied by value.
 type Histogram struct {
-	mu   sync.RWMutex
+	mu   sync.Mutex
 	data histogramData
 }
 
-// New creates a fixed-size histogram. lowestDiscernible controls resolution and
-// is rounded down to a power of two internally; values below it, including zero,
-// remain valid samples. highestTrackable must be at least twice lowestDiscernible.
-// significantFigures must be between 0 and 5, inclusive. Unrepresentable geometry
-// returns ErrInvalidArgument. Storage is allocated once, according to the range
-// and precision, independently of the number of samples recorded.
+// New creates a fixed-size histogram with a fixed range and precision.
+//
+// lowestDiscernible must be at least one and sets the smallest bucket width,
+// rounded down to a power of two. For example, 1000 selects width 512, grouping
+// values 0..511 together. Values below lowestDiscernible remain valid samples.
+// highestTrackable must be at least twice lowestDiscernible; values outside
+// [0, highestTrackable] cannot be recorded. Increasing this maximum reserves more
+// counters without changing the resolution at already-supported values.
+//
+// significantFigures must be an int from 0 through 5. More figures give finer
+// relative precision at larger values and use more memory. With base width one,
+// 2 figures bound relative quantization error below 1%, 3 below 0.1%, and 4 below
+// 0.01%. A coarser base width limits resolution near zero regardless of figures.
+// Zero figures selects coarse precision, not an automatic default. See the
+// package documentation for examples and the full precision range.
+//
+// Use the same units for bounds, samples, and correction intervals. Storage is
+// allocated once according to these settings, independently of sample count;
+// each snapshot copies that storage. Invalid settings or unrepresentable geometry
+// return ErrInvalidArgument.
 func New(lowestDiscernible, highestTrackable int64, significantFigures int) (*Histogram, error) {
 	g, err := newGeometry(lowestDiscernible, highestTrackable, significantFigures)
 	if err != nil {
 		return nil, err
 	}
 	return &Histogram{
-		mu: sync.RWMutex{},
+		mu: sync.Mutex{},
 		data: histogramData{
 			geometry: g,
 			counts:   make([]int64, g.countsLen),
@@ -51,60 +65,63 @@ func New(lowestDiscernible, highestTrackable int64, significantFigures int) (*Hi
 	}, nil
 }
 
-// RecordValue records one occurrence of value. Successful calls allocate no memory.
-func (h *Histogram) RecordValue(value int64) error {
-	return h.RecordValues(value, 1)
+// Record records one occurrence of value. Successful calls allocate no memory.
+// Errors leave the histogram unchanged.
+func (h *Histogram) Record(value int64) error {
+	return h.RecordN(value, 1)
 }
 
-// RecordValues records count occurrences of value in constant time without
+// RecordN records count occurrences of value in constant time without
 // allocation. A zero count is a no-op after validation; a negative count is invalid.
 // Errors leave the histogram unchanged.
-func (h *Histogram) RecordValues(value, count int64) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+func (h *Histogram) RecordN(value, count int64) error {
 	if count < 0 {
 		return ErrInvalidArgument
 	}
 	if err := h.data.validateValue(value); err != nil {
 		return err
 	}
+	if count == 0 {
+		return nil
+	}
+	index := h.data.geometry.index(value)
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if count > math.MaxInt64-h.data.total {
 		return ErrCountOverflow
 	}
-	if count != 0 {
-		h.data.add(h.data.geometry.index(value), count)
-	}
+	h.data.add(index, count)
 	return nil
 }
 
-// RecordCorrectedValue records value and compensates for coordinated omission by
-// recording value-expectedInterval, value-2*expectedInterval, and so on, while
-// the generated value is at least expectedInterval. Zero disables correction;
+// RecordCorrected records value and compensates for coordinated omission by
+// recording value-interval, value-2*interval, and so on, while
+// the generated value is at least interval. Zero disables correction;
 // negative intervals are invalid. The entire operation is atomic and errors
 // leave the histogram unchanged. Work is proportional to the number of occupied
 // buckets in the generated sequence, not to the number of generated samples.
-func (h *Histogram) RecordCorrectedValue(value, expectedInterval int64) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if expectedInterval < 0 {
+func (h *Histogram) RecordCorrected(value, interval int64) error {
+	if interval < 0 {
 		return ErrInvalidArgument
 	}
 	if err := h.data.validateValue(value); err != nil {
 		return err
 	}
 	remaining := int64(1)
-	if expectedInterval > 0 {
-		remaining = max(1, value/expectedInterval)
+	if interval > 0 {
+		remaining = max(1, value/interval)
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if remaining > math.MaxInt64-h.data.total {
 		return ErrCountOverflow
 	}
 	for {
 		index := h.data.geometry.index(value)
 		count := int64(1)
-		if expectedInterval > 0 {
+		if interval > 0 {
 			from, _ := h.data.geometry.bounds(index)
-			count = min(remaining, (value-from)/expectedInterval+1)
+			count = min(remaining, (value-from)/interval+1)
 		}
 		h.data.add(index, count)
 		remaining -= count
@@ -112,7 +129,7 @@ func (h *Histogram) RecordCorrectedValue(value, expectedInterval int64) error {
 			return nil
 		}
 		// A remaining sample guarantees this product is <= value.
-		value -= count * expectedInterval
+		value -= count * interval
 	}
 }
 
@@ -120,99 +137,42 @@ func (h *Histogram) RecordCorrectedValue(value, expectedInterval int64) error {
 func (h *Histogram) Reset() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	clear(h.data.counts)
+	if h.data.total == 0 {
+		return
+	}
+	clear(h.data.counts[h.data.minIndex : h.data.maxIndex+1])
 	h.data.total = 0
 	h.data.minIndex = len(h.data.counts)
 	h.data.maxIndex = -1
 }
 
-// Merge adds a consistent snapshot of other to h. All three constructor settings
-// must match exactly. A self-merge atomically doubles the counts. Errors leave h
-// unchanged. Merges never hold locks on two histograms at the same time.
-func (h *Histogram) Merge(other *Histogram) error {
-	if other == nil {
+// Merge adds the captured samples in source to h without modifying source or
+// allocating memory. All three constructor settings must match exactly, even
+// for an empty source. A nil or uninitialized source is invalid. Errors leave h
+// unchanged. Repeated merges add the captured samples repeatedly.
+func (h *Histogram) Merge(source *Snapshot) error {
+	if source == nil {
 		return ErrInvalidArgument
 	}
 	// Geometry is immutable, so checking it needs no lock.
-	if h.data.geometry.countsLen == 0 || other.data.geometry.countsLen == 0 {
+	if h.data.geometry.countsLen == 0 || source.data.geometry.countsLen == 0 {
 		return ErrInvalidArgument
 	}
-	if !h.data.geometry.compatible(other.data.geometry) {
+	if !h.data.geometry.compatible(source.data.geometry) {
 		return ErrIncompatibleConfiguration
 	}
-	if h == other {
-		h.mu.Lock()
-		defer h.mu.Unlock()
-		return h.data.merge(&h.data)
-	}
-	source := other.Snapshot()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.data.merge(&source.data)
 }
 
-// Snapshot returns an immutable, independent copy captured under a read lock.
+// Snapshot returns an immutable, independent copy captured under the mutex.
 // It copies the entire counts array, requiring O(configured bucket count) time
 // and memory. Use it to make multiple queries against the same set of samples.
 func (h *Histogram) Snapshot() *Snapshot {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	data := h.data
 	data.counts = slices.Clone(data.counts)
 	return &Snapshot{data: data}
-}
-
-// RecordedValues returns an iterator over occupied buckets in ascending order.
-// It captures a snapshot immediately, before iteration begins. No histogram lock
-// is held while yielding to caller code. The iterator can be reused.
-func (h *Histogram) RecordedValues() iter.Seq[Bucket] {
-	return h.Snapshot().RecordedValues()
-}
-
-// TotalCount returns the number of samples, including generated correction samples.
-func (h *Histogram) TotalCount() int64 {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return h.data.total
-}
-
-// Min returns the first occupied bucket's lower bound, or zero when empty.
-func (h *Histogram) Min() int64 {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return h.data.min()
-}
-
-// Max returns the last occupied bucket's upper bound, or zero when empty.
-// This bound can exceed highestTrackable because of quantization.
-func (h *Histogram) Max() int64 {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return h.data.max()
-}
-
-// Mean estimates the arithmetic mean using bucket midpoints, or returns zero
-// when empty. Midpoints are rounded up to an integer.
-func (h *Histogram) Mean() float64 {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return h.data.mean()
-}
-
-// StdDev estimates the population standard deviation using bucket midpoints,
-// or returns zero when empty.
-func (h *Histogram) StdDev() float64 {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return h.data.stdDev()
-}
-
-// ValueAtPercentile returns an HDR percentile estimate. percentile must be finite
-// and within [0, 100]. Zero returns Min; positive percentiles return an occupied
-// bucket's upper bound, with 100 returning Max. Empty histograms return zero.
-// Invalid percentiles return ErrInvalidArgument even when the histogram is empty.
-func (h *Histogram) ValueAtPercentile(percentile float64) (int64, error) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return h.data.valueAtPercentile(percentile)
 }

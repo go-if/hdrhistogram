@@ -6,13 +6,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var benchmarkHistogram *Histogram
+var (
+	benchmarkHistogram   *Histogram
+	benchmarkSnapshot    *Snapshot
+	benchmarkStatistic   float64
+	benchmarkPercentile  int64
+	benchmarkPercentiles []int64
+)
 
 func BenchmarkNew(b *testing.B) {
 	for _, tc := range []struct {
 		name    string
 		figures int
-	}{{"Figures1", 1}, {"Figures3", 3}, {"Figures5", 5}} {
+	}{{"Precision1", 1}, {"Precision3", 3}, {"Precision5", 5}} {
 		b.Run(tc.name, func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
@@ -26,21 +32,21 @@ func BenchmarkNew(b *testing.B) {
 	}
 }
 
-func BenchmarkRecordValue(b *testing.B) {
+func BenchmarkRecord(b *testing.B) {
 	h := newTestHistogram(b, 1, 3_600_000_000, 3)
 	b.ReportAllocs()
 	for b.Loop() {
-		if err := h.RecordValue(12345); err != nil {
+		if err := h.Record(12345); err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-func BenchmarkRecordValues(b *testing.B) {
+func BenchmarkRecordN(b *testing.B) {
 	h := newTestHistogram(b, 1, 3_600_000_000, 3)
 	b.ReportAllocs()
 	for b.Loop() {
-		if err := h.RecordValues(12345, 100); err != nil {
+		if err := h.RecordN(12345, 100); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -52,7 +58,7 @@ func BenchmarkRecordParallel(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			if err := h.RecordValue(12345); err != nil {
+			if err := h.Record(12345); err != nil {
 				b.Error(err)
 				return
 			}
@@ -60,11 +66,11 @@ func BenchmarkRecordParallel(b *testing.B) {
 	})
 }
 
-func BenchmarkRecordCorrectedValue(b *testing.B) {
+func BenchmarkRecordCorrected(b *testing.B) {
 	h := newTestHistogram(b, 1, 3_600_000_000, 3)
 	b.ReportAllocs()
 	for b.Loop() {
-		if err := h.RecordCorrectedValue(100_000_000, 10_000); err != nil {
+		if err := h.RecordCorrected(100_000_000, 10_000); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -79,17 +85,44 @@ func benchmarkPopulated(b *testing.B) *Histogram {
 	return h
 }
 
-func BenchmarkValueAtPercentile(b *testing.B) {
-	h := benchmarkPopulated(b)
+func BenchmarkPercentile(b *testing.B) {
+	s := benchmarkPopulated(b).Snapshot()
 	b.ReportAllocs()
 	for b.Loop() {
-		if _, err := h.ValueAtPercentile(99); err != nil {
+		value, err := s.Percentile(99)
+		if err != nil {
 			b.Fatal(err)
 		}
+		benchmarkPercentile = value
 	}
 }
 
-var benchmarkSnapshot *Snapshot
+func BenchmarkPercentiles(b *testing.B) {
+	s := benchmarkPopulated(b).Snapshot()
+	ps := []float64{50, 90, 95, 99, 99.9}
+	b.Run("Together", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			values, err := s.Percentiles(ps)
+			if err != nil {
+				b.Fatal(err)
+			}
+			benchmarkPercentiles = values
+		}
+	})
+	b.Run("Individually", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			for _, p := range ps {
+				value, err := s.Percentile(p)
+				if err != nil {
+					b.Fatal(err)
+				}
+				benchmarkPercentile = value
+			}
+		}
+	})
+}
 
 func BenchmarkSnapshot(b *testing.B) {
 	h := benchmarkPopulated(b)
@@ -99,78 +132,81 @@ func BenchmarkSnapshot(b *testing.B) {
 	}
 }
 
-var benchmarkStatistic float64
-
 func BenchmarkMean(b *testing.B) {
-	h := benchmarkPopulated(b)
+	s := benchmarkPopulated(b).Snapshot()
 	b.ReportAllocs()
 	for b.Loop() {
-		benchmarkStatistic = h.Mean()
+		benchmarkStatistic = s.Mean()
 	}
 }
 
 func BenchmarkStdDev(b *testing.B) {
-	h := benchmarkPopulated(b)
+	s := benchmarkPopulated(b).Snapshot()
 	b.ReportAllocs()
 	for b.Loop() {
-		benchmarkStatistic = h.StdDev()
+		benchmarkStatistic = s.StdDev()
 	}
 }
 
 func BenchmarkReset(b *testing.B) {
-	h := benchmarkPopulated(b)
-	b.ReportAllocs()
-	// Reset clears the full counts array even when it is already empty. Reuse
-	// the array to measure clearing and locking without timing sample recording.
-	for b.Loop() {
-		h.Reset()
-	}
+	b.Run("Empty", func(b *testing.B) {
+		h := newTestHistogram(b, 1, 3_600_000_000, 3)
+		b.ReportAllocs()
+		for b.Loop() {
+			h.Reset()
+		}
+	})
+	b.Run("Populated", func(b *testing.B) {
+		h := benchmarkPopulated(b)
+		s := h.Snapshot()
+		b.ReportAllocs()
+		for b.Loop() {
+			b.StopTimer()
+			if err := h.Merge(s); err != nil {
+				b.Fatal(err)
+			}
+			b.StartTimer()
+			h.Reset()
+		}
+	})
 }
 
 func BenchmarkMerge(b *testing.B) {
-	source := benchmarkPopulated(b)
-	destination := newTestHistogram(b, 1, 3_600_000_000, 3)
-	b.ReportAllocs()
-	for b.Loop() {
-		if err := destination.Merge(source); err != nil {
-			b.Fatal(err)
+	source := benchmarkPopulated(b).Snapshot()
+	b.Run("Populated", func(b *testing.B) {
+		destination := newTestHistogram(b, 1, 3_600_000_000, 3)
+		b.ReportAllocs()
+		for b.Loop() {
+			if err := destination.Merge(source); err != nil {
+				b.Fatal(err)
+			}
 		}
-	}
-	require.Equal(b, int64(b.N)*source.TotalCount(), destination.TotalCount(), "merged count")
+		require.Equal(b, int64(b.N)*source.TotalCount(), destination.Snapshot().TotalCount(), "merged count")
+	})
+	b.Run("Empty", func(b *testing.B) {
+		destination := newTestHistogram(b, 1, 3_600_000_000, 3)
+		b.ReportAllocs()
+		for b.Loop() {
+			b.StopTimer()
+			destination.Reset()
+			b.StartTimer()
+			if err := destination.Merge(source); err != nil {
+				b.Fatal(err)
+			}
+		}
+		require.Equal(b, source.TotalCount(), destination.Snapshot().TotalCount(), "merged count")
+	})
 }
 
-func BenchmarkRecordedValues(b *testing.B) {
-	h := benchmarkPopulated(b)
-	snapshot := h.Snapshot()
-	for _, tc := range []struct {
-		name        string
-		useSnapshot bool
-	}{
-		// Histogram iteration includes capturing a new snapshot on every call.
-		{"Histogram", false},
-		{"Snapshot", true},
-	} {
-		b.Run(tc.name, func(b *testing.B) {
-			b.ReportAllocs()
-			var count int64
-			// Dispatch outside the timed loop. Calling an iterator through a
-			// function value would add escaping closures to the measurement.
-			if tc.useSnapshot {
-				for b.Loop() {
-					count = 0
-					for bucket := range snapshot.RecordedValues() {
-						count += bucket.Count
-					}
-				}
-			} else {
-				for b.Loop() {
-					count = 0
-					for bucket := range h.RecordedValues() {
-						count += bucket.Count
-					}
-				}
-			}
-			require.Equal(b, h.TotalCount(), count, "iterated count")
-		})
+func BenchmarkBuckets(b *testing.B) {
+	snapshot := benchmarkPopulated(b).Snapshot()
+	b.ReportAllocs()
+	var count int64
+	for b.Loop() {
+		count = 0
+		for bucket := range snapshot.Buckets() {
+			count += bucket.Count
+		}
 	}
+	require.Equal(b, snapshot.TotalCount(), count, "iterated count")
 }

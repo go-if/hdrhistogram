@@ -1,8 +1,10 @@
 package hdrhistogram
 
 import (
+	"cmp"
 	"iter"
 	"math"
+	"slices"
 )
 
 // Bucket describes an occupied equivalence range, inclusive at both ends.
@@ -26,6 +28,7 @@ func (s *Snapshot) TotalCount() int64 { return s.data.total }
 func (s *Snapshot) Min() int64 { return s.data.min() }
 
 // Max returns the last occupied bucket's upper bound, or zero when empty.
+// This bound can exceed highestTrackable because of quantization.
 func (s *Snapshot) Max() int64 { return s.data.max() }
 
 // Mean estimates the arithmetic mean using integer bucket midpoints rounded up,
@@ -36,14 +39,68 @@ func (s *Snapshot) Mean() float64 { return s.data.mean() }
 // or returns zero when empty.
 func (s *Snapshot) StdDev() float64 { return s.data.stdDev() }
 
-// ValueAtPercentile has the same percentile semantics as Histogram.ValueAtPercentile.
-func (s *Snapshot) ValueAtPercentile(percentile float64) (int64, error) {
-	return s.data.valueAtPercentile(percentile)
+// Percentile returns an HDR percentile estimate. p must be finite and within
+// [0, 100]. Zero returns Min; positive percentiles return an occupied bucket's
+// upper bound, with 100 returning Max. Empty snapshots return zero. Invalid
+// percentiles return ErrInvalidArgument even when the snapshot is empty.
+func (s *Snapshot) Percentile(p float64) (int64, error) {
+	if !validPercentile(p) {
+		return 0, ErrInvalidArgument
+	}
+	return s.data.percentile(p), nil
 }
 
-// RecordedValues returns a reusable iterator over occupied buckets in ascending
+// Percentiles returns estimates with the same semantics as Percentile, in the
+// order requested, including duplicates. It does not modify or retain ps. It
+// sorts requests internally and scans the counts once. An empty request returns
+// nil, nil; any invalid percentile returns nil, ErrInvalidArgument.
+func (s *Snapshot) Percentiles(ps []float64) ([]int64, error) {
+	for _, p := range ps {
+		if !validPercentile(p) {
+			return nil, ErrInvalidArgument
+		}
+	}
+	if len(ps) == 0 {
+		return nil, nil
+	}
+	values := make([]int64, len(ps))
+	if s.data.total == 0 {
+		return values, nil
+	}
+	order := make([]int, len(ps))
+	for i := range order {
+		order[i] = i
+	}
+	slices.SortFunc(order, func(a, b int) int { return cmp.Compare(ps[a], ps[b]) })
+	index := s.data.minIndex
+	var cumulative int64
+	for _, request := range order {
+		p := ps[request]
+		if p == 0 {
+			values[request] = s.Min()
+			continue
+		}
+		if p == 100 {
+			values[request] = s.Max()
+			continue
+		}
+		rank := percentileRank(p, s.data.total)
+		for cumulative < rank {
+			cumulative += s.data.counts[index]
+			index++
+		}
+		_, values[request] = s.data.geometry.bounds(index - 1)
+	}
+	return values, nil
+}
+
+func validPercentile(p float64) bool {
+	return !math.IsNaN(p) && p >= 0 && p <= 100
+}
+
+// Buckets returns a reusable iterator over occupied buckets in ascending
 // order. Iteration does not copy the counts array and never holds a lock.
-func (s *Snapshot) RecordedValues() iter.Seq[Bucket] {
+func (s *Snapshot) Buckets() iter.Seq[Bucket] {
 	return func(yield func(Bucket) bool) {
 		if s.data.total == 0 {
 			return
@@ -57,127 +114,4 @@ func (s *Snapshot) RecordedValues() iter.Seq[Bucket] {
 			}
 		}
 	}
-}
-
-// histogramData has no synchronization of its own. A Histogram guards it with a
-// mutex; a Snapshot owns a detached copy that is never mutated.
-type histogramData struct {
-	geometry geometry
-	counts   []int64
-	total    int64
-	minIndex int
-	maxIndex int
-}
-
-func (d *histogramData) validateValue(value int64) error {
-	if d.geometry.countsLen == 0 {
-		return ErrInvalidArgument
-	}
-	if value < 0 || value > d.geometry.highest {
-		return ErrOutOfRange
-	}
-	return nil
-}
-
-// add requires a positive count and a checked total. Since counts are nonnegative
-// and sum to total, checking total also prevents overflow in every individual bin.
-func (d *histogramData) add(index int, count int64) {
-	d.counts[index] += count
-	d.total += count
-	d.minIndex = min(d.minIndex, index)
-	d.maxIndex = max(d.maxIndex, index)
-}
-
-// merge also supports source == d: each bin is read once, and total is changed last.
-func (d *histogramData) merge(source *histogramData) error {
-	if source.total > math.MaxInt64-d.total {
-		return ErrCountOverflow
-	}
-	if source.total == 0 {
-		return nil
-	}
-	for i := source.minIndex; i <= source.maxIndex; i++ {
-		d.counts[i] += source.counts[i]
-	}
-	d.minIndex = min(d.minIndex, source.minIndex)
-	d.maxIndex = max(d.maxIndex, source.maxIndex)
-	d.total += source.total
-	return nil
-}
-
-func (d *histogramData) min() int64 {
-	if d.total == 0 {
-		return 0
-	}
-	from, _ := d.geometry.bounds(d.minIndex)
-	return from
-}
-
-func (d *histogramData) max() int64 {
-	if d.total == 0 {
-		return 0
-	}
-	_, to := d.geometry.bounds(d.maxIndex)
-	return to
-}
-
-func (d *histogramData) mean() float64 {
-	if d.total == 0 {
-		return 0
-	}
-	var mean float64
-	for i := d.minIndex; i <= d.maxIndex; i++ {
-		if count := d.counts[i]; count != 0 {
-			mean += float64(d.geometry.midpoint(i)) * (float64(count) / float64(d.total))
-		}
-	}
-	return mean
-}
-
-func (d *histogramData) stdDev() float64 {
-	if d.total == 0 {
-		return 0
-	}
-	mean := d.mean()
-	var variance float64
-	for i := d.minIndex; i <= d.maxIndex; i++ {
-		if count := d.counts[i]; count != 0 {
-			deviation := float64(d.geometry.midpoint(i)) - mean
-			variance += deviation * deviation * (float64(count) / float64(d.total))
-		}
-	}
-	return math.Sqrt(variance)
-}
-
-func (d *histogramData) valueAtPercentile(percentile float64) (int64, error) {
-	if math.IsNaN(percentile) || percentile < 0 || percentile > 100 {
-		return 0, ErrInvalidArgument
-	}
-	if d.total == 0 {
-		return 0, nil
-	}
-	if percentile == 0 {
-		return d.min(), nil
-	}
-	if percentile == 100 {
-		return d.max(), nil
-	}
-	// HDR removes one ULP before rounding the rank up, avoiding a spurious
-	// jump to the next bucket at floating-point percentile boundaries.
-	p := math.Nextafter(percentile, math.Inf(-1))
-	floatRank := math.Ceil(p * float64(d.total) / 100)
-	rank := d.total
-	// float64(MaxInt64) rounds to 1<<63; clamp before converting to int64.
-	if floatRank < float64(d.total) {
-		rank = max(1, int64(floatRank))
-	}
-	var cumulative int64
-	for i := d.minIndex; i <= d.maxIndex; i++ {
-		cumulative += d.counts[i]
-		if cumulative >= rank {
-			_, to := d.geometry.bounds(i)
-			return to, nil
-		}
-	}
-	return d.max(), nil
 }

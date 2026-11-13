@@ -57,16 +57,23 @@ func FuzzPercentilesAndCounts(f *testing.F) {
 				samples = append(samples, value)
 			}
 		}
-		require.Equal(t, int64(len(samples)), h.TotalCount(), "sample count not conserved")
-		buckets := slices.Collect(h.RecordedValues())
+		snapshot := h.Snapshot()
+		require.Equal(t, int64(len(samples)), snapshot.TotalCount(), "sample count not conserved")
+		buckets := slices.Collect(snapshot.Buckets())
 		require.Len(t, buckets, len(wantBuckets))
 		for _, b := range buckets {
 			require.Equal(t, wantBuckets[b.From], b)
 		}
 		slices.Sort(samples)
+		ps := make([]float64, 101)
+		for i := range ps {
+			ps[i] = float64(100 - i)
+		}
+		percentiles, err := snapshot.Percentiles(ps)
+		require.NoError(t, err)
 		previous := int64(0)
 		for p := range 101 {
-			got, err := h.ValueAtPercentile(float64(p))
+			got, err := snapshot.Percentile(float64(p))
 			require.NoError(t, err)
 			require.GreaterOrEqual(t, got, previous, "nonmonotonic p%d", p)
 			previous = got
@@ -81,6 +88,7 @@ func FuzzPercentilesAndCounts(f *testing.F) {
 				}
 			}
 			require.Equal(t, want, got, "p%d", p)
+			require.Equal(t, want, percentiles[100-p], "batch p%d", p)
 		}
 		require.NoError(t, snapshotProblem(h.Snapshot()))
 	})
@@ -95,7 +103,7 @@ func FuzzCorrectedRecording(f *testing.F) {
 		lowest, figures := int64(rawLowest)+1, int(precision%4)
 		h := newTestHistogram(t, lowest, 65535, figures)
 		want := newTestHistogram(t, lowest, 65535, figures)
-		require.NoError(t, h.RecordCorrectedValue(value, interval))
+		require.NoError(t, h.RecordCorrected(value, interval))
 		record(t, want, value, 1)
 		if interval > 0 {
 			for v := value - interval; v >= interval; v -= interval {
